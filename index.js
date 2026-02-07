@@ -4,6 +4,9 @@ if (!process.env.DISCORD_TOKEN) {
 }
 
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
+const { joinVoiceChannel, createAudioPlayer, createAudioResource, AudioPlayerStatus } = require('@discordjs/voice');
+const ytdl = require('ytdl-core');
+const ytSearch = require('yt-search');
 const axios = require('axios');
 const fs = require('fs');
 
@@ -13,7 +16,8 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.GuildMembers,
-    GatewayIntentBits.GuildMessageReactions
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildVoiceStates
   ]
 });
 
@@ -32,22 +36,23 @@ let stats = {
   totalCommands: 0,
   memberJoins: 0,
   streamsAnnounced: 0,
+  songsPlayed: 0,
   startTime: Date.now()
 };
 
-// Load saved stats
 if (fs.existsSync('stats.json')) {
   stats = JSON.parse(fs.readFileSync('stats.json'));
 }
 
-// Save stats function
 function saveStats() {
   fs.writeFileSync('stats.json', JSON.stringify(stats, null, 2));
 }
 
+// Music queue
+const queue = new Map();
+
 // Role message ID
 let roleMessageId = null;
-
 let isLive = false;
 let lastStreamId = null;
 
@@ -101,51 +106,67 @@ async function createRoleMessage() {
   }
 }
 
-// Reaction add
+// Reaction handlers
 client.on('messageReactionAdd', async (reaction, user) => {
-  if (user.bot) return;
-  if (reaction.message.id !== roleMessageId) return;
+  if (user.bot || reaction.message.id !== roleMessageId) return;
   
   const guild = reaction.message.guild;
   const member = await guild.members.fetch(user.id);
   
-  const roleMap = {
-    '🎮': 'Warframe',
-    '💻': 'Coder',
-    '🎨': 'Artist'
-  };
-  
+  const roleMap = { '🎮': 'Warframe', '💻': 'Coder', '🎨': 'Artist' };
   const roleName = roleMap[reaction.emoji.name];
   if (!roleName) return;
   
   const role = guild.roles.cache.find(r => r.name === roleName);
-  if (role) {
-    await member.roles.add(role);
-  }
+  if (role) await member.roles.add(role);
 });
 
-// Reaction remove
 client.on('messageReactionRemove', async (reaction, user) => {
-  if (user.bot) return;
-  if (reaction.message.id !== roleMessageId) return;
+  if (user.bot || reaction.message.id !== roleMessageId) return;
   
   const guild = reaction.message.guild;
   const member = await guild.members.fetch(user.id);
   
-  const roleMap = {
-    '🎮': 'Warframe',
-    '💻': 'Coder',
-    '🎨': 'Artist'
-  };
-  
+  const roleMap = { '🎮': 'Warframe', '💻': 'Coder', '🎨': 'Artist' };
   const roleName = roleMap[reaction.emoji.name];
   if (!roleName) return;
   
   const role = guild.roles.cache.find(r => r.name === roleName);
-  if (role) {
-    await member.roles.remove(role);
-  }
+  if (role) await member.roles.remove(role);
 });
+
+// MUSIC FUNCTIONS
+async function playSong(guild, song) {
+  const serverQueue = queue.get(guild.id);
+  
+  if (!song) {
+    serverQueue.connection.destroy();
+    queue.delete(guild.id);
+    return;
+  }
+  
+  const player = createAudioPlayer();
+  const stream = ytdl(song.url, { filter: 'audioonly', highWaterMark: 1 << 25 });
+  const resource = createAudioResource(stream);
+  
+  player.play(resource);
+  serverQueue.connection.subscribe(player);
+  
+  stats.songsPlayed++;
+  saveStats();
+  
+  player.on(AudioPlayerStatus.Idle, () => {
+    serverQueue.songs.shift();
+    playSong(guild, serverQueue.songs[0]);
+  });
+  
+  player.on('error', error => {
+    console.error('Music error:', error);
+    serverQueue.textChannel.send('❌ Error playing song. Skipping...');
+    serverQueue.songs.shift();
+    playSong(guild, serverQueue.songs[0]);
+  });
+}
 
 // Track messages
 client.on('messageCreate', async (message) => {
@@ -162,8 +183,156 @@ client.on('messageCreate', async (message) => {
   const args = message.content.slice(1).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
+  // MUSIC COMMANDS
+  if (command === 'play' || command === 'p') {
+    const voiceChannel = message.member.voice.channel;
+    if (!voiceChannel) return message.reply('❌ You need to be in a voice channel!');
+    
+    const permissions = voiceChannel.permissionsFor(message.client.user);
+    if (!permissions.has('CONNECT') || !permissions.has('SPEAK')) {
+      return message.reply('❌ I need permissions to join and speak in your voice channel!');
+    }
+    
+    const searchQuery = args.join(' ');
+    if (!searchQuery) return message.reply('❌ Provide a song name or YouTube URL!');
+    
+    message.channel.send(`🔍 Searching for: **${searchQuery}**...`);
+    
+    try {
+      let songInfo;
+      
+      if (ytdl.validateURL(searchQuery)) {
+        songInfo = await ytdl.getInfo(searchQuery);
+      } else {
+        const searchResults = await ytSearch(searchQuery);
+        if (!searchResults.videos.length) return message.reply('❌ No results found!');
+        songInfo = await ytdl.getInfo(searchResults.videos[0].url);
+      }
+      
+      const song = {
+        title: songInfo.videoDetails.title,
+        url: songInfo.videoDetails.video_url,
+        duration: songInfo.videoDetails.lengthSeconds,
+        thumbnail: songInfo.videoDetails.thumbnails[0].url,
+        requester: message.author.tag
+      };
+      
+      let serverQueue = queue.get(message.guild.id);
+      
+      if (!serverQueue) {
+        const queueConstruct = {
+          textChannel: message.channel,
+          voiceChannel: voiceChannel,
+          connection: null,
+          songs: [],
+          volume: 5,
+          playing: true
+        };
+        
+        queue.set(message.guild.id, queueConstruct);
+        queueConstruct.songs.push(song);
+        
+        try {
+          const connection = joinVoiceChannel({
+            channelId: voiceChannel.id,
+            guildId: message.guild.id,
+            adapterCreator: message.guild.voiceAdapterCreator,
+          });
+          
+          queueConstruct.connection = connection;
+          playSong(message.guild, queueConstruct.songs[0]);
+          
+          const embed = new EmbedBuilder()
+            .setColor(0xDC143C)
+            .setTitle('🎵 Now Playing')
+            .setDescription(`[${song.title}](${song.url})`)
+            .setThumbnail(song.thumbnail)
+            .addFields(
+              { name: 'Duration', value: `${Math.floor(song.duration / 60)}:${(song.duration % 60).toString().padStart(2, '0')}`, inline: true },
+              { name: 'Requested by', value: song.requester, inline: true }
+            );
+          
+          message.channel.send({ embeds: [embed] });
+        } catch (err) {
+          console.error(err);
+          queue.delete(message.guild.id);
+          return message.reply('❌ Could not join voice channel!');
+        }
+      } else {
+        serverQueue.songs.push(song);
+        
+        const embed = new EmbedBuilder()
+          .setColor(0xDC143C)
+          .setTitle('🎵 Added to Queue')
+          .setDescription(`[${song.title}](${song.url})`)
+          .setThumbnail(song.thumbnail)
+          .addFields(
+            { name: 'Position', value: `#${serverQueue.songs.length}`, inline: true },
+            { name: 'Requested by', value: song.requester, inline: true }
+          );
+        
+        return message.channel.send({ embeds: [embed] });
+      }
+    } catch (error) {
+      console.error(error);
+      return message.reply('❌ Error finding song!');
+    }
+  }
+
+  if (command === 'skip' || command === 's') {
+    const serverQueue = queue.get(message.guild.id);
+    if (!serverQueue) return message.reply('❌ Nothing is playing!');
+    if (!message.member.voice.channel) return message.reply('❌ You need to be in a voice channel!');
+    
+    serverQueue.connection.destroy();
+    message.reply('⏭️ Skipped!');
+  }
+
+  if (command === 'stop') {
+    const serverQueue = queue.get(message.guild.id);
+    if (!serverQueue) return message.reply('❌ Nothing is playing!');
+    if (!message.member.voice.channel) return message.reply('❌ You need to be in a voice channel!');
+    
+    serverQueue.songs = [];
+    serverQueue.connection.destroy();
+    queue.delete(message.guild.id);
+    message.reply('⏹️ Stopped and cleared queue!');
+  }
+
+  if (command === 'queue' || command === 'q') {
+    const serverQueue = queue.get(message.guild.id);
+    if (!serverQueue || !serverQueue.songs.length) return message.reply('❌ Queue is empty!');
+    
+    const embed = new EmbedBuilder()
+      .setColor(0xDC143C)
+      .setTitle('🎵 Music Queue')
+      .setDescription(serverQueue.songs.map((song, index) => 
+        `${index === 0 ? '▶️' : `${index + 1}.`} [${song.title}](${song.url}) - ${song.requester}`
+      ).join('\n').substring(0, 4000));
+    
+    message.channel.send({ embeds: [embed] });
+  }
+
+  if (command === 'np' || command === 'nowplaying') {
+    const serverQueue = queue.get(message.guild.id);
+    if (!serverQueue || !serverQueue.songs.length) return message.reply('❌ Nothing is playing!');
+    
+    const song = serverQueue.songs[0];
+    const embed = new EmbedBuilder()
+      .setColor(0xDC143C)
+      .setTitle('🎵 Now Playing')
+      .setDescription(`[${song.title}](${song.url})`)
+      .setThumbnail(song.thumbnail)
+      .addFields(
+        { name: 'Requested by', value: song.requester, inline: true }
+      );
+    
+    message.channel.send({ embeds: [embed] });
+  }
+
+  // OTHER COMMANDS
   if (command === 'help') {
-    message.reply('Commands: !ping, !drop [item], !wiki [search], !live, !roles, !stats, !serverinfo');
+    message.reply('Commands: !play [song], !skip, !stop, !queue, !np, !ping, !drop, !wiki, !live, !roles, !stats, !serverinfo');
   }
 
   if (command === 'ping') {
@@ -195,7 +364,6 @@ client.on('messageCreate', async (message) => {
     message.reply({ embeds: [embed] });
   }
 
-  // SERVER STATS COMMAND
   if (command === 'stats') {
     const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
     const hours = Math.floor(uptime / 3600);
@@ -205,40 +373,36 @@ client.on('messageCreate', async (message) => {
       .setColor(0xDC143C)
       .setTitle('📊 KymeraBot Stats')
       .addFields(
-        { name: '💬 Messages Tracked', value: String(stats.totalMessages), inline: true },
-        { name: '⌨️ Commands Used', value: String(stats.totalCommands), inline: true },
+        { name: '💬 Messages', value: String(stats.totalMessages), inline: true },
+        { name: '⌨️ Commands', value: String(stats.totalCommands), inline: true },
         { name: '👋 Members Joined', value: String(stats.memberJoins), inline: true },
-        { name: '🔴 Streams Announced', value: String(stats.streamsAnnounced), inline: true },
-        { name: '⏱️ Bot Uptime', value: `${hours}h ${minutes}m`, inline: true }
+        { name: '🔴 Streams', value: String(stats.streamsAnnounced), inline: true },
+        { name: '🎵 Songs Played', value: String(stats.songsPlayed), inline: true },
+        { name: '⏱️ Uptime', value: `${hours}h ${minutes}m`, inline: true }
       )
       .setTimestamp();
     
     message.reply({ embeds: [embed] });
   }
 
-  // SERVER INFO COMMAND
   if (command === 'serverinfo') {
     const guild = message.guild;
     const totalMembers = guild.memberCount;
-    const onlineMembers = guild.members.cache.filter(m => m.presence?.status === 'online').size;
     const textChannels = guild.channels.cache.filter(c => c.type === 0).size;
     const voiceChannels = guild.channels.cache.filter(c => c.type === 2).size;
-    const roles = guild.roles.cache.size - 1; // Exclude @everyone
-    const created = guild.createdAt.toDateString();
+    const roles = guild.roles.cache.size - 1;
     
     const embed = new EmbedBuilder()
       .setColor(0xDC143C)
       .setTitle(`📈 ${guild.name} Server Info`)
       .setThumbnail(guild.iconURL())
       .addFields(
-        { name: '👥 Total Members', value: String(totalMembers), inline: true },
-        { name: '🟢 Online Now', value: String(onlineMembers), inline: true },
-        { name: '💬 Text Channels', value: String(textChannels), inline: true },
-        { name: '🔊 Voice Channels', value: String(voiceChannels), inline: true },
+        { name: '👥 Members', value: String(totalMembers), inline: true },
+        { name: '💬 Text', value: String(textChannels), inline: true },
+        { name: '🔊 Voice', value: String(voiceChannels), inline: true },
         { name: '🏷️ Roles', value: String(roles), inline: true },
-        { name: '📅 Created', value: created, inline: true }
+        { name: '📅 Created', value: guild.createdAt.toDateString(), inline: true }
       )
-      .setFooter({ text: `Server ID: ${guild.id}` })
       .setTimestamp();
     
     message.reply({ embeds: [embed] });
@@ -266,7 +430,7 @@ client.on('guildMemberAdd', async (member) => {
   channel.send({ embeds: [embed] });
 });
 
-// TWITCH LIVE CHECK
+// Twitch check
 async function checkTwitch() {
   try {
     const tokenRes = await axios.post('https://id.twitch.tv/oauth2/token', null, {
@@ -284,12 +448,10 @@ async function checkTwitch() {
         'Client-ID': CONFIG.twitchClientId,
         'Authorization': `Bearer ${accessToken}`
       },
-      params: {
-        user_login: CONFIG.twitchChannel
-      }
+      params: { user_login: CONFIG.twitchChannel }
     });
 
-    const channel = client.channels.cache.get(CONFIG.announcementChannel);
+    const channel = client.channels.cache.get(CONFIG.announcement_CHANNEL_ID);
     if (!channel) return;
 
     if (streamRes.data.data.length > 0) {
@@ -314,12 +476,8 @@ async function checkTwitch() {
           .setTimestamp();
 
         channel.send({ content: '@here', embeds: [embed] });
-        console.log(`🔴 Announced stream: ${stream.title}`);
       }
     } else {
-      if (isLive) {
-        console.log('⚫ Stream ended');
-      }
       isLive = false;
       lastStreamId = null;
     }
