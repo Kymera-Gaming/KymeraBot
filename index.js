@@ -1,4 +1,7 @@
-require('dotenv').config();
+// Load .env locally, but Railway provides vars automatically
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 
 const client = new Client({
