@@ -11,7 +11,8 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildMembers
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.GuildMessageReactions
   ]
 });
 
@@ -24,20 +25,110 @@ const CONFIG = {
   twitchClientSecret: process.env.TWITCH_CLIENT_SECRET
 };
 
+// Role message ID (will be set when created)
+let roleMessageId = null;
+
 let isLive = false;
 let lastStreamId = null;
 
 // Bot ready
-client.on('ready', () => {
+client.on('ready', async () => {
   console.log(`✅ ${client.user.tag} is online!`);
   client.user.setActivity('Warframe | !help', { type: 'PLAYING' });
+  
+  // Create role message if it doesn't exist
+  await createRoleMessage();
   
   // Check Twitch every 2 minutes
   if (CONFIG.twitchClientId && CONFIG.twitchClientId !== 'esxex3tcfso8mnbauccx47o5calegp') {
     setInterval(checkTwitch, 120000);
     console.log('🔴 Twitch alerts enabled');
-  } else {
-    console.log('⚠️ Twitch alerts disabled (no valid client ID)');
+  }
+});
+
+// Create reaction role message
+async function createRoleMessage() {
+  try {
+    const guild = client.guilds.cache.first();
+    if (!guild) return;
+    
+    const channel = guild.channels.cache.get(CONFIG.welcomeChannel);
+    if (!channel) return;
+    
+    // Check if message already exists
+    const messages = await channel.messages.fetch({ limit: 10 });
+    const existingMsg = messages.find(m => m.author.id === client.user.id && m.embeds[0]?.title === 'Get Your Roles!');
+    
+    if (existingMsg) {
+      roleMessageId = existingMsg.id;
+      console.log('✅ Role message exists');
+      return;
+    }
+    
+    // Create new role message
+    const embed = new EmbedBuilder()
+      .setColor(0xDC143C)
+      .setTitle('Get Your Roles!')
+      .setDescription('React to get access to channels:\n\n🎮 **Warframe** - Warframe discussion & LFG\n💻 **Coder** - Bot development & coding\n🎨 **Artist** - Fashion Frame & creative')
+      .setFooter({ text: 'Click the emoji below!' });
+    
+    const msg = await channel.send({ embeds: [embed] });
+    await msg.react('🎮');
+    await msg.react('💻');
+    await msg.react('🎨');
+    
+    roleMessageId = msg.id;
+    console.log('✅ Role message created');
+  } catch (error) {
+    console.error('Role message error:', error);
+  }
+}
+
+// Reaction add
+client.on('messageReactionAdd', async (reaction, user) => {
+  if (user.bot) return;
+  if (reaction.message.id !== roleMessageId) return;
+  
+  const guild = reaction.message.guild;
+  const member = await guild.members.fetch(user.id);
+  
+  const roleMap = {
+    '🎮': 'Warframe',
+    '💻': 'Coder',
+    '🎨': 'Artist'
+  };
+  
+  const roleName = roleMap[reaction.emoji.name];
+  if (!roleName) return;
+  
+  const role = guild.roles.cache.find(r => r.name === roleName);
+  if (role) {
+    await member.roles.add(role);
+    console.log(`Added ${roleName} to ${user.tag}`);
+  }
+});
+
+// Reaction remove
+client.on('messageReactionRemove', async (reaction, user) => {
+  if (user.bot) return;
+  if (reaction.message.id !== roleMessageId) return;
+  
+  const guild = reaction.message.guild;
+  const member = await guild.members.fetch(user.id);
+  
+  const roleMap = {
+    '🎮': 'Warframe',
+    '💻': 'Coder',
+    '🎨': 'Artist'
+  };
+  
+  const roleName = roleMap[reaction.emoji.name];
+  if (!roleName) return;
+  
+  const role = guild.roles.cache.find(r => r.name === roleName);
+  if (role) {
+    await member.roles.remove(role);
+    console.log(`Removed ${roleName} from ${user.tag}`);
   }
 });
 
@@ -67,7 +158,7 @@ client.on('messageCreate', async (message) => {
   const command = args.shift().toLowerCase();
 
   if (command === 'help') {
-    message.reply('Commands: !ping, !drop [item], !wiki [search], !live');
+    message.reply('Commands: !ping, !drop [item], !wiki [search], !live, !roles');
   }
 
   if (command === 'ping') {
@@ -89,12 +180,19 @@ client.on('messageCreate', async (message) => {
   if (command === 'live') {
     message.reply('🔴 Check if Kymera is live: https://twitch.tv/Kymera_Gaming');
   }
+
+  if (command === 'roles') {
+    const embed = new EmbedBuilder()
+      .setColor(0xDC143C)
+      .setTitle('Available Roles')
+      .setDescription('🎮 Warframe - Warframe players\n💻 Coder - Developers\n🎨 Artist - Content creators');
+    message.reply({ embeds: [embed] });
+  }
 });
 
 // TWITCH LIVE CHECK
 async function checkTwitch() {
   try {
-    // Get OAuth token
     const tokenRes = await axios.post('https://id.twitch.tv/oauth2/token', null, {
       params: {
         client_id: CONFIG.twitchClientId,
@@ -105,7 +203,6 @@ async function checkTwitch() {
     
     const accessToken = tokenRes.data.access_token;
 
-    // Check if live
     const streamRes = await axios.get('https://api.twitch.tv/helix/streams', {
       headers: {
         'Client-ID': CONFIG.twitchClientId,
@@ -119,17 +216,15 @@ async function checkTwitch() {
     const channel = client.channels.cache.get(CONFIG.announcementChannel);
     if (!channel) return;
 
-    // If live and wasn't live before (or different stream)
     if (streamRes.data.data.length > 0) {
       const stream = streamRes.data.data[0];
       
-      // Only announce if new stream (different ID)
       if (stream.id !== lastStreamId) {
         lastStreamId = stream.id;
         isLive = true;
         
         const embed = new EmbedBuilder()
-          .setColor(0x9146FF) // Twitch purple
+          .setColor(0x9146FF)
           .setTitle('🔴 Kymera is LIVE!')
           .setURL(`https://twitch.tv/${CONFIG.twitchChannel}`)
           .setDescription(`**${stream.title}**`)
@@ -144,7 +239,6 @@ async function checkTwitch() {
         console.log(`🔴 Announced stream: ${stream.title}`);
       }
     } else {
-      // Not live anymore
       if (isLive) {
         console.log('⚫ Stream ended');
       }
