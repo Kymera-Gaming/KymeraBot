@@ -5,6 +5,7 @@ if (!process.env.DISCORD_TOKEN) {
 
 const { Client, GatewayIntentBits, EmbedBuilder } = require('discord.js');
 const axios = require('axios');
+const fs = require('fs');
 
 const client = new Client({
   intents: [
@@ -25,7 +26,26 @@ const CONFIG = {
   twitchClientSecret: process.env.TWITCH_CLIENT_SECRET
 };
 
-// Role message ID (will be set when created)
+// Stats tracking
+let stats = {
+  totalMessages: 0,
+  totalCommands: 0,
+  memberJoins: 0,
+  streamsAnnounced: 0,
+  startTime: Date.now()
+};
+
+// Load saved stats
+if (fs.existsSync('stats.json')) {
+  stats = JSON.parse(fs.readFileSync('stats.json'));
+}
+
+// Save stats function
+function saveStats() {
+  fs.writeFileSync('stats.json', JSON.stringify(stats, null, 2));
+}
+
+// Role message ID
 let roleMessageId = null;
 
 let isLive = false;
@@ -36,14 +56,14 @@ client.on('ready', async () => {
   console.log(`✅ ${client.user.tag} is online!`);
   client.user.setActivity('Warframe | !help', { type: 'PLAYING' });
   
-  // Create role message if it doesn't exist
   await createRoleMessage();
   
-  // Check Twitch every 2 minutes
-  if (CONFIG.twitchClientId && CONFIG.twitchClientId !== 'esxex3tcfso8mnbauccx47o5calegp') {
+  if (CONFIG.twitchClientId && CONFIG.twitchClientId !== 'esxex3cfso8mnbauccx47o5calegp') {
     setInterval(checkTwitch, 120000);
     console.log('🔴 Twitch alerts enabled');
   }
+  
+  console.log(`📊 Stats loaded: ${stats.totalMessages} messages, ${stats.totalCommands} commands`);
 });
 
 // Create reaction role message
@@ -55,17 +75,14 @@ async function createRoleMessage() {
     const channel = guild.channels.cache.get(CONFIG.welcomeChannel);
     if (!channel) return;
     
-    // Check if message already exists
     const messages = await channel.messages.fetch({ limit: 10 });
     const existingMsg = messages.find(m => m.author.id === client.user.id && m.embeds[0]?.title === 'Get Your Roles!');
     
     if (existingMsg) {
       roleMessageId = existingMsg.id;
-      console.log('✅ Role message exists');
       return;
     }
     
-    // Create new role message
     const embed = new EmbedBuilder()
       .setColor(0xDC143C)
       .setTitle('Get Your Roles!')
@@ -104,7 +121,6 @@ client.on('messageReactionAdd', async (reaction, user) => {
   const role = guild.roles.cache.find(r => r.name === roleName);
   if (role) {
     await member.roles.add(role);
-    console.log(`Added ${roleName} to ${user.tag}`);
   }
 });
 
@@ -128,41 +144,31 @@ client.on('messageReactionRemove', async (reaction, user) => {
   const role = guild.roles.cache.find(r => r.name === roleName);
   if (role) {
     await member.roles.remove(role);
-    console.log(`Removed ${roleName} from ${user.tag}`);
   }
 });
 
-// Welcome message
-client.on('guildMemberAdd', async (member) => {
-  const channel = member.guild.channels.cache.get(CONFIG.welcomeChannel);
-  if (!channel) return;
-
-  const embed = new EmbedBuilder()
-    .setColor(0xDC143C)
-    .setTitle('Welcome to Kymera_Gaming! 🎮')
-    .setDescription(`Hey ${member}, welcome!`)
-    .addFields(
-      { name: 'Schedule', value: 'Mon/Wed/Fri 2PM EST', inline: true },
-      { name: 'Twitch', value: 'twitch.tv/Kymera_Gaming', inline: true }
-    )
-    .setTimestamp();
-
-  channel.send({ embeds: [embed] });
-});
-
-// Commands
+// Track messages
 client.on('messageCreate', async (message) => {
-  if (message.author.bot || !message.content.startsWith('!')) return;
+  if (message.author.bot) return;
+  
+  stats.totalMessages++;
+  saveStats();
+  
+  if (!message.content.startsWith('!')) return;
+  
+  stats.totalCommands++;
+  saveStats();
 
   const args = message.content.slice(1).trim().split(/ +/);
   const command = args.shift().toLowerCase();
 
   if (command === 'help') {
-    message.reply('Commands: !ping, !drop [item], !wiki [search], !live, !roles');
+    message.reply('Commands: !ping, !drop [item], !wiki [search], !live, !roles, !stats, !serverinfo');
   }
 
   if (command === 'ping') {
-    message.reply(`🏓 Pong! ${Date.now() - message.createdTimestamp}ms`);
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
+    message.reply(`🏓 Pong! ${Date.now() - message.createdTimestamp}ms\n⏱️ Bot uptime: ${Math.floor(uptime / 3600)}h ${Math.floor((uptime % 3600) / 60)}m`);
   }
 
   if (command === 'drop') {
@@ -188,6 +194,76 @@ client.on('messageCreate', async (message) => {
       .setDescription('🎮 Warframe - Warframe players\n💻 Coder - Developers\n🎨 Artist - Content creators');
     message.reply({ embeds: [embed] });
   }
+
+  // SERVER STATS COMMAND
+  if (command === 'stats') {
+    const uptime = Math.floor((Date.now() - stats.startTime) / 1000);
+    const hours = Math.floor(uptime / 3600);
+    const minutes = Math.floor((uptime % 3600) / 60);
+    
+    const embed = new EmbedBuilder()
+      .setColor(0xDC143C)
+      .setTitle('📊 KymeraBot Stats')
+      .addFields(
+        { name: '💬 Messages Tracked', value: String(stats.totalMessages), inline: true },
+        { name: '⌨️ Commands Used', value: String(stats.totalCommands), inline: true },
+        { name: '👋 Members Joined', value: String(stats.memberJoins), inline: true },
+        { name: '🔴 Streams Announced', value: String(stats.streamsAnnounced), inline: true },
+        { name: '⏱️ Bot Uptime', value: `${hours}h ${minutes}m`, inline: true }
+      )
+      .setTimestamp();
+    
+    message.reply({ embeds: [embed] });
+  }
+
+  // SERVER INFO COMMAND
+  if (command === 'serverinfo') {
+    const guild = message.guild;
+    const totalMembers = guild.memberCount;
+    const onlineMembers = guild.members.cache.filter(m => m.presence?.status === 'online').size;
+    const textChannels = guild.channels.cache.filter(c => c.type === 0).size;
+    const voiceChannels = guild.channels.cache.filter(c => c.type === 2).size;
+    const roles = guild.roles.cache.size - 1; // Exclude @everyone
+    const created = guild.createdAt.toDateString();
+    
+    const embed = new EmbedBuilder()
+      .setColor(0xDC143C)
+      .setTitle(`📈 ${guild.name} Server Info`)
+      .setThumbnail(guild.iconURL())
+      .addFields(
+        { name: '👥 Total Members', value: String(totalMembers), inline: true },
+        { name: '🟢 Online Now', value: String(onlineMembers), inline: true },
+        { name: '💬 Text Channels', value: String(textChannels), inline: true },
+        { name: '🔊 Voice Channels', value: String(voiceChannels), inline: true },
+        { name: '🏷️ Roles', value: String(roles), inline: true },
+        { name: '📅 Created', value: created, inline: true }
+      )
+      .setFooter({ text: `Server ID: ${guild.id}` })
+      .setTimestamp();
+    
+    message.reply({ embeds: [embed] });
+  }
+});
+
+// Track member joins
+client.on('guildMemberAdd', async (member) => {
+  stats.memberJoins++;
+  saveStats();
+  
+  const channel = member.guild.channels.cache.get(CONFIG.welcomeChannel);
+  if (!channel) return;
+
+  const embed = new EmbedBuilder()
+    .setColor(0xDC143C)
+    .setTitle('Welcome to Kymera_Gaming! 🎮')
+    .setDescription(`Hey ${member}, welcome!`)
+    .addFields(
+      { name: 'Schedule', value: 'Mon/Wed/Fri 2PM EST', inline: true },
+      { name: 'Twitch', value: 'twitch.tv/Kymera_Gaming', inline: true }
+    )
+    .setTimestamp();
+
+  channel.send({ embeds: [embed] });
 });
 
 // TWITCH LIVE CHECK
@@ -222,6 +298,8 @@ async function checkTwitch() {
       if (stream.id !== lastStreamId) {
         lastStreamId = stream.id;
         isLive = true;
+        stats.streamsAnnounced++;
+        saveStats();
         
         const embed = new EmbedBuilder()
           .setColor(0x9146FF)
